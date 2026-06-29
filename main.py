@@ -63,7 +63,7 @@ SUMMARY_MODEL = os.environ.get("SUMMARY_MODEL", "groq/compound")    # recherche 
 # Si GEMINI_API_KEY est défini, l'identification passe par Gemini (bien meilleur
 # pour reconnaître logos, marques, monuments). Sinon, on retombe sur Groq.
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3-flash")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
 ALLOWED_MIME = {"image/jpeg", "image/png", "image/webp"}
@@ -257,6 +257,30 @@ def health():
         "service": "lumen",
         "models": {"vision_provider": provider, "vision": vision, "summary": SUMMARY_MODEL},
     }
+
+
+@app.get("/api/models")
+def list_gemini_models():
+    """Debug : liste les modèles Gemini utilisables avec ta clé (ceux qui gèrent generateContent)."""
+    if not GEMINI_API_KEY:
+        return {"erreur": "GEMINI_API_KEY non définie."}
+    try:
+        with httpx.Client(timeout=20) as http:
+            resp = http.get(
+                "https://generativelanguage.googleapis.com/v1beta/models",
+                headers={"x-goog-api-key": GEMINI_API_KEY},
+            )
+        if resp.status_code != 200:
+            return {"erreur": f"Gemini {resp.status_code}", "detail": resp.text[:300]}
+        noms = [
+            m.get("name", "").replace("models/", "")
+            for m in resp.json().get("models", [])
+            if "generateContent" in m.get("supportedGenerationMethods", [])
+        ]
+        return {"modele_actuel": GEMINI_MODEL, "disponibles": noms}
+    except Exception as exc:  # noqa: BLE001
+        log.error("Erreur list_models: %s", exc)
+        return {"erreur": "Impossible de lister les modèles."}
 
 
 @app.post("/api/identify")
