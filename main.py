@@ -228,7 +228,7 @@ async def identify(request: Request, image: UploadFile = File(...), mode: str = 
                 },
             ],
             temperature=0.2,
-            max_completion_tokens=600,
+            max_tokens=600,
             response_format={"type": "json_object"},
         )
         result = _extract_json(completion.choices[0].message.content)
@@ -259,7 +259,7 @@ def summarize(request: Request, body: SummarizeBody):
                 {"role": "user", "content": user},
             ],
             temperature=0.4,
-            max_completion_tokens=4000,
+            max_tokens=4000,
         )
         fiche = _extract_json(completion.choices[0].message.content)
     except json.JSONDecodeError:
