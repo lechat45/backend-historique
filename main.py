@@ -359,7 +359,7 @@ def summarize(request: Request, body: SummarizeBody):
                 {"role": "user", "content": user},
             ],
             temperature=0.4,
-            max_tokens=4000,
+            max_tokens=1500,
         )
         fiche = _extract_json(completion.choices[0].message.content)
     except json.JSONDecodeError:
