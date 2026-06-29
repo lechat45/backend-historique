@@ -226,7 +226,7 @@ def gemini_identify(b64: str, mime: str, indication: str) -> dict:
         ],
         "generationConfig": {
             "temperature": 0.2,
-            "maxOutputTokens": 1024,
+            "maxOutputTokens": 4096,   # marge pour le raisonnement + le JSON
             "responseMimeType": "application/json",
         },
     }
@@ -321,7 +321,14 @@ def wikipedia_context(sujet: str, langue: str) -> dict | None:
     lang = _wiki_lang(langue)
     api = f"https://{lang}.wikipedia.org/w/api.php"
     try:
-        with httpx.Client(timeout=15, headers={"User-Agent": "LumenApp/1.0 (educational)"}) as http:
+        with httpx.Client(
+            timeout=15,
+            headers={
+                # Wikimedia exige un User-Agent identifiable AVEC un contact (URL/email).
+                "User-Agent": "LumenApp/1.0 (https://lechat45.github.io; projet educatif)",
+                "Accept": "application/json",
+            },
+        ) as http:
             # 1) Trouver la meilleure page correspondant au sujet.
             search = http.get(api, params={
                 "action": "query", "format": "json",
@@ -381,7 +388,9 @@ def gemini_summarize(system: str, user: str, wiki: dict | None = None) -> dict:
         "contents": [{"role": "user", "parts": [{"text": user_final}]}],
         "generationConfig": {
             "temperature": 0.4,
-            "maxOutputTokens": 2048,
+            # Gemini 3 "réfléchit" avant de répondre, ce qui consomme des tokens de sortie.
+            # On laisse une marge large pour que le JSON ne soit jamais tronqué.
+            "maxOutputTokens": 8192,
             "responseMimeType": "application/json",
             "responseSchema": FICHE_SCHEMA,
         },
