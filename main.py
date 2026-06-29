@@ -157,8 +157,11 @@ SUMMARY_SYSTEM = (
 # --------------------------------------------------------------------------- #
 
 def _extract_json(text: str) -> dict:
-    """Parse robuste : tolère un éventuel bloc ```json ou du texte parasite."""
+    """Parse robuste : tolère un bloc ```json, du texte parasite ou un bloc <think>."""
     text = (text or "").strip()
+    # Certains modèles (mode "thinking") préfixent un bloc <think>...</think>
+    if "</think>" in text:
+        text = text.split("</think>", 1)[1].strip()
     if text.startswith("```"):
         text = text.strip("`")
         if text.lower().startswith("json"):
@@ -229,9 +232,21 @@ async def identify(request: Request, image: UploadFile = File(...), mode: str = 
             ],
             temperature=0.2,
             max_tokens=600,
-            response_format={"type": "json_object"},
         )
-        result = _extract_json(completion.choices[0].message.content)
+        raw = completion.choices[0].message.content or ""
+        try:
+            result = _extract_json(raw)
+        except json.JSONDecodeError:
+            # Le modèle n'a pas renvoyé de JSON exploitable : on échoue proprement
+            # plutôt que de renvoyer une 502 opaque.
+            result = {
+                "type": "autre",
+                "nom_probable": "",
+                "candidats": [],
+                "texte_ocr": "",
+                "indices_visuels": "",
+                "confiance": 0,
+            }
     except Exception as exc:  # noqa: BLE001
         log.error("Erreur identify: %s", exc)
         raise HTTPException(status_code=502, detail="L'identification a échoué. Réessaie.")
