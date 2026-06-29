@@ -57,11 +57,12 @@ MAX_IMAGE_BYTES = int(MAX_IMAGE_MB * 1024 * 1024)
 RATE_LIMIT_PER_MIN = int(os.environ.get("RATE_LIMIT_PER_MIN", "20"))
 
 VISION_MODEL = os.environ.get("VISION_MODEL", "qwen/qwen3.6-27b")   # vision Groq (repli)
-SUMMARY_MODEL = os.environ.get("SUMMARY_MODEL", "groq/compound")    # recherche web intégrée
+SUMMARY_MODEL = os.environ.get("SUMMARY_MODEL", "groq/compound")    # Groq : recherche web réelle (gratuit)
 
-# --- Vision Gemini (optionnelle mais recommandée pour les logos) ---------- #
-# Si GEMINI_API_KEY est défini, l'identification passe par Gemini (bien meilleur
-# pour reconnaître logos, marques, monuments). Sinon, on retombe sur Groq.
+# --- Gemini : identification (logos/marques/monuments) ------------------- #
+# Si GEMINI_API_KEY est défini, l'identification passe par Gemini (bien meilleur).
+# La rédaction, elle, utilise Groq compound (vraies sources web, gratuit),
+# avec repli sur Gemini si Groq échoue — pour toujours renvoyer une fiche.
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
@@ -248,6 +249,33 @@ def gemini_identify(b64: str, mime: str, indication: str) -> dict:
         return _empty_identify()
 
 
+def groq_summarize(system: str, user: str) -> dict:
+    """Rédaction via Groq compound (recherche web réelle, gratuite).
+    Compound injecte les résultats de recherche dans le contexte : si la requête
+    dépasse la limite (413), on réessaie avec une sortie plus courte."""
+    last_exc = None
+    for max_out in (1024, 512):
+        try:
+            completion = client.chat.completions.create(
+                model=SUMMARY_MODEL,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                temperature=0.4,
+                max_tokens=max_out,
+            )
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            msg = str(exc).lower()
+            if "413" in msg or "too_large" in msg or "too large" in msg:
+                log.warning("compound 413 à max_tokens=%s -> nouvel essai plus court", max_out)
+                continue
+            raise
+        return _extract_json(completion.choices[0].message.content)  # JSONDecodeError remonte
+    raise last_exc
+
+
 def gemini_summarize(system: str, user: str, use_search: bool) -> dict:
     """Rédige la fiche via Gemini. Si use_search, active la recherche Google
     (vraies sources) ; sinon force le JSON et s'appuie sur les connaissances."""
@@ -263,6 +291,15 @@ def gemini_summarize(system: str, user: str, use_search: bool) -> dict:
         payload["tools"] = [{"google_search": {}}]
     else:
         gen_config["responseMimeType"] = "application/json"
+        # Sans recherche, on cadre les sources pour éviter toute URL inventée.
+        payload["systemInstruction"]["parts"].append({"text": (
+            "\nIMPORTANT : tu n'as PAS accès à la recherche web ici. "
+            "Ne cite donc QUE des sources stables et certaines : le site officiel "
+            "du sujet et sa page Wikipédia (URL canoniques, ex. "
+            "https://fr.wikipedia.org/wiki/Nom_du_sujet). N'invente JAMAIS d'URL "
+            "d'article précis. Indique dans \"avertissement\" que les faits "
+            "méritent vérification."
+        )})
 
     headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
     with httpx.Client(timeout=60) as http:
@@ -297,13 +334,17 @@ def gemini_summarize(system: str, user: str, use_search: bool) -> dict:
 
 @app.get("/")
 def health():
-    provider = "gemini" if GEMINI_API_KEY else "groq"
     vision = GEMINI_MODEL if GEMINI_API_KEY else VISION_MODEL
-    summary = GEMINI_MODEL if GEMINI_API_KEY else SUMMARY_MODEL
+    vision_provider = "gemini" if GEMINI_API_KEY else "groq"
     return {
         "status": "ok",
         "service": "lumen",
-        "models": {"provider": provider, "vision": vision, "summary": summary},
+        "models": {
+            "vision_provider": vision_provider,
+            "vision": vision,
+            "summary": SUMMARY_MODEL,           # Groq compound = recherche web réelle
+            "summary_fallback": GEMINI_MODEL if GEMINI_API_KEY else None,
+        },
     }
 
 
@@ -400,33 +441,18 @@ def summarize(request: Request, body: SummarizeBody):
     )
 
     try:
+        # 1) Rédaction principale : Groq compound = recherche web réelle, gratuite.
+        fiche = groq_summarize(system, user)
+    except Exception as exc:  # noqa: BLE001  (inclut JSONDecodeError, 413, réseau…)
+        log.warning("Rédaction Groq indisponible (%s)", exc)
+        # 2) Repli : Gemini sans recherche, pour toujours renvoyer une fiche.
         if GEMINI_API_KEY:
             try:
-                # 1) Gemini AVEC recherche web -> vraies sources si le tier l'autorise.
-                fiche = gemini_summarize(system, user, use_search=True)
-            except json.JSONDecodeError:
-                raise
-            except Exception as exc:  # noqa: BLE001
-                # 2) Repli : Gemini SANS recherche (JSON forcé, sources canoniques).
-                log.warning("Grounding indisponible (%s) -> repli sans recherche", exc)
                 fiche = gemini_summarize(system, user, use_search=False)
+            except Exception as exc2:  # noqa: BLE001
+                log.error("Repli Gemini KO: %s", exc2)
+                raise HTTPException(status_code=502, detail="La génération de la fiche a échoué. Réessaie.")
         else:
-            # 3) Repli historique : Groq.
-            completion = client.chat.completions.create(
-                model=SUMMARY_MODEL,
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-                temperature=0.4,
-                max_tokens=1500,
-            )
-            fiche = _extract_json(completion.choices[0].message.content)
-    except json.JSONDecodeError:
-        log.error("JSON invalide depuis le modèle de résumé")
-        raise HTTPException(status_code=502, detail="La fiche n'a pas pu être structurée. Réessaie.")
-    except Exception as exc:  # noqa: BLE001
-        log.error("Erreur summarize: %s", exc)
-        raise HTTPException(status_code=502, detail="La génération de la fiche a échoué. Réessaie.")
+            raise HTTPException(status_code=502, detail="La génération de la fiche a échoué. Réessaie.")
 
     return JSONResponse(fiche)
