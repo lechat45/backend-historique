@@ -248,14 +248,62 @@ def gemini_identify(b64: str, mime: str, indication: str) -> dict:
         return _empty_identify()
 
 
+def gemini_summarize(system: str, user: str, use_search: bool) -> dict:
+    """Rédige la fiche via Gemini. Si use_search, active la recherche Google
+    (vraies sources) ; sinon force le JSON et s'appuie sur les connaissances."""
+    url = GEMINI_URL.format(model=GEMINI_MODEL)
+    gen_config = {"temperature": 0.4, "maxOutputTokens": 2048}
+    payload = {
+        "systemInstruction": {"parts": [{"text": system}]},
+        "contents": [{"role": "user", "parts": [{"text": user}]}],
+        "generationConfig": gen_config,
+    }
+    if use_search:
+        # Outil de recherche web : ne peut pas être combiné au mode JSON forcé.
+        payload["tools"] = [{"google_search": {}}]
+    else:
+        gen_config["responseMimeType"] = "application/json"
+
+    headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
+    with httpx.Client(timeout=60) as http:
+        resp = http.post(url, json=payload, headers=headers)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Gemini summarize {resp.status_code}: {resp.text[:300]}")
+
+    candidates = resp.json().get("candidates") or []
+    if not candidates:
+        raise RuntimeError("Gemini summarize : aucune réponse.")
+    cand = candidates[0]
+    parts = cand.get("content", {}).get("parts", [])
+    text = "".join(p.get("text", "") for p in parts).strip()
+    fiche = _extract_json(text)  # peut lever JSONDecodeError -> géré plus haut
+
+    # Si la recherche a tourné, on remplace les sources par les pages réellement
+    # consultées (URLs vérifiées par Gemini), plus fiables que celles "devinées".
+    grounding = cand.get("groundingMetadata", {}) or {}
+    vraies = []
+    for chunk in grounding.get("groundingChunks", []) or []:
+        web = chunk.get("web", {}) or {}
+        if web.get("uri"):
+            vraies.append({
+                "titre": web.get("title", "") or web.get("uri", ""),
+                "url": web["uri"],
+                "fiabilite": "presse",
+            })
+    if vraies:
+        fiche["sources"] = vraies[:6]
+    return fiche
+
+
 @app.get("/")
 def health():
     provider = "gemini" if GEMINI_API_KEY else "groq"
     vision = GEMINI_MODEL if GEMINI_API_KEY else VISION_MODEL
+    summary = GEMINI_MODEL if GEMINI_API_KEY else SUMMARY_MODEL
     return {
         "status": "ok",
         "service": "lumen",
-        "models": {"vision_provider": provider, "vision": vision, "summary": SUMMARY_MODEL},
+        "models": {"provider": provider, "vision": vision, "summary": summary},
     }
 
 
@@ -352,16 +400,28 @@ def summarize(request: Request, body: SummarizeBody):
     )
 
     try:
-        completion = client.chat.completions.create(
-            model=SUMMARY_MODEL,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            temperature=0.4,
-            max_tokens=1500,
-        )
-        fiche = _extract_json(completion.choices[0].message.content)
+        if GEMINI_API_KEY:
+            try:
+                # 1) Gemini AVEC recherche web -> vraies sources si le tier l'autorise.
+                fiche = gemini_summarize(system, user, use_search=True)
+            except json.JSONDecodeError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                # 2) Repli : Gemini SANS recherche (JSON forcé, sources canoniques).
+                log.warning("Grounding indisponible (%s) -> repli sans recherche", exc)
+                fiche = gemini_summarize(system, user, use_search=False)
+        else:
+            # 3) Repli historique : Groq.
+            completion = client.chat.completions.create(
+                model=SUMMARY_MODEL,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                temperature=0.4,
+                max_tokens=1500,
+            )
+            fiche = _extract_json(completion.choices[0].message.content)
     except json.JSONDecodeError:
         log.error("JSON invalide depuis le modèle de résumé")
         raise HTTPException(status_code=502, detail="La fiche n'a pas pu être structurée. Réessaie.")
