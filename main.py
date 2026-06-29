@@ -393,30 +393,46 @@ def gemini_summarize(system: str, user: str, wiki: dict | None = None) -> dict:
         )
         user_final = user
 
-    url = GEMINI_URL.format(model=GEMINI_MODEL)
-    payload = {
-        "systemInstruction": {"parts": [{"text": system_final}]},
-        "contents": [{"role": "user", "parts": [{"text": user_final}]}],
-        "generationConfig": {
-            "temperature": 0.4,
-            # Gemini 3 "réfléchit" avant de répondre, ce qui consomme des tokens de sortie.
-            # On laisse une marge large pour que le JSON ne soit jamais tronqué.
-            "maxOutputTokens": 8192,
-            "responseMimeType": "application/json",
-            "responseSchema": FICHE_SCHEMA,
-        },
+    base_gen = {
+        "temperature": 0.4,
+        "responseMimeType": "application/json",
+        "responseSchema": FICHE_SCHEMA,
     }
+    sys_instr = {"parts": [{"text": system_final}]}
+    contents = [{"role": "user", "parts": [{"text": user_final}]}]
     headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
-    with httpx.Client(timeout=60) as http:
-        resp = http.post(url, json=payload, headers=headers)
-    if resp.status_code != 200:
-        raise RuntimeError(f"Gemini summarize {resp.status_code}: {resp.text[:300]}")
+    url = GEMINI_URL.format(model=GEMINI_MODEL)
 
-    candidates = resp.json().get("candidates") or []
-    if not candidates:
-        raise RuntimeError("Gemini summarize : aucune réponse.")
-    parts = candidates[0].get("content", {}).get("parts", [])
-    text = "".join(p.get("text", "") for p in parts).strip()
+    # Gemini 3 compte son "raisonnement" dans maxOutputTokens : par défaut il remplit
+    # presque tout le budget, ce qui tronque le JSON. On réduit donc le raisonnement.
+    # On essaie plusieurs réglages (le bon paramètre varie selon la version du modèle) :
+    #  1) thinkingLevel bas (Gemini 3)  2) thinkingBudget bas (compat 2.5/3)  3) gros budget brut.
+    attempts = [
+        {**base_gen, "maxOutputTokens": 8192, "thinkingConfig": {"thinkingLevel": "low"}},
+        {**base_gen, "maxOutputTokens": 8192, "thinkingConfig": {"thinkingBudget": 512}},
+        {**base_gen, "maxOutputTokens": 65535},
+    ]
+
+    text = ""
+    with httpx.Client(timeout=120) as http:
+        for gen in attempts:
+            payload = {"systemInstruction": sys_instr, "contents": contents, "generationConfig": gen}
+            resp = http.post(url, json=payload, headers=headers)
+            if resp.status_code != 200:
+                log.warning("Gemini summarize %s: %s", resp.status_code, resp.text[:200])
+                continue
+            cand = (resp.json().get("candidates") or [{}])[0]
+            parts = cand.get("content", {}).get("parts", [])
+            t = "".join(p.get("text", "") for p in parts).strip()
+            if t and cand.get("finishReason") != "MAX_TOKENS":
+                text = t
+                break
+            if t and not text:  # garde une sortie tronquée en dernier recours
+                text = t
+
+    if not text:
+        raise RuntimeError("Gemini summarize : réponse vide ou tronquée.")
+
     fiche = _extract_json(text)
     fiche = _recover_double_encoded(fiche)  # filet de sécurité anti double-encodage
 
