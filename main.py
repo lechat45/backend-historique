@@ -249,58 +249,143 @@ def gemini_identify(b64: str, mime: str, indication: str) -> dict:
         return _empty_identify()
 
 
-def groq_summarize(system: str, user: str) -> dict:
-    """Rédaction via Groq compound (recherche web réelle, gratuite).
-    Compound injecte les résultats de recherche dans le contexte : si la requête
-    dépasse la limite (413), on réessaie avec une sortie plus courte."""
-    last_exc = None
-    for max_out in (1024, 512):
-        try:
-            completion = client.chat.completions.create(
-                model=SUMMARY_MODEL,
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-                temperature=0.4,
-                max_tokens=max_out,
-            )
-        except Exception as exc:  # noqa: BLE001
-            last_exc = exc
-            msg = str(exc).lower()
-            if "413" in msg or "too_large" in msg or "too large" in msg:
-                log.warning("compound 413 à max_tokens=%s -> nouvel essai plus court", max_out)
-                continue
-            raise
-        return _extract_json(completion.choices[0].message.content)  # JSONDecodeError remonte
-    raise last_exc
+# Schéma imposé à Gemini : il DOIT renvoyer un JSON conforme -> plus d'erreur de parsing.
+FICHE_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "sujet": {"type": "STRING"},
+        "categorie": {"type": "STRING"},
+        "confiance": {"type": "INTEGER"},
+        "accroche": {"type": "STRING"},
+        "resume": {"type": "STRING"},
+        "chiffres_cles": {
+            "type": "ARRAY",
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "label": {"type": "STRING"},
+                    "valeur": {"type": "STRING"},
+                    "annee": {"type": "STRING"},
+                },
+            },
+        },
+        "chronologie": {
+            "type": "ARRAY",
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "date": {"type": "STRING"},
+                    "evenement": {"type": "STRING"},
+                },
+            },
+        },
+        "impact": {"type": "STRING"},
+        "le_saviez_vous": {"type": "ARRAY", "items": {"type": "STRING"}},
+        "sources": {
+            "type": "ARRAY",
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "titre": {"type": "STRING"},
+                    "url": {"type": "STRING"},
+                    "fiabilite": {"type": "STRING"},
+                },
+            },
+        },
+        "pour_approfondir": {"type": "ARRAY", "items": {"type": "STRING"}},
+        "avertissement": {"type": "STRING"},
+    },
+}
 
 
-def gemini_summarize(system: str, user: str, use_search: bool) -> dict:
-    """Rédige la fiche via Gemini. Si use_search, active la recherche Google
-    (vraies sources) ; sinon force le JSON et s'appuie sur les connaissances."""
-    url = GEMINI_URL.format(model=GEMINI_MODEL)
-    gen_config = {"temperature": 0.4, "maxOutputTokens": 2048}
-    payload = {
-        "systemInstruction": {"parts": [{"text": system}]},
-        "contents": [{"role": "user", "parts": [{"text": user}]}],
-        "generationConfig": gen_config,
-    }
-    if use_search:
-        # Outil de recherche web : ne peut pas être combiné au mode JSON forcé.
-        payload["tools"] = [{"google_search": {}}]
+WIKI_CHARS = 5000  # longueur d'extrait Wikipédia envoyée à Gemini
+
+
+def _wiki_lang(langue: str) -> str:
+    """Déduit le code Wikipédia (fr, en, …) à partir de la langue demandée."""
+    l = (langue or "").lower()
+    if l.startswith("en") or "angl" in l or "english" in l:
+        return "en"
+    if l.startswith("es") or "espagn" in l or "spanish" in l:
+        return "es"
+    if l.startswith("de") or "allem" in l or "german" in l:
+        return "de"
+    if l.startswith("it") or "ital" in l:
+        return "it"
+    return "fr"
+
+
+def wikipedia_context(sujet: str, langue: str) -> dict | None:
+    """Cherche le sujet sur Wikipédia et renvoie {titre, url, extrait} ou None.
+    API publique, sans clé, sans facturation."""
+    lang = _wiki_lang(langue)
+    api = f"https://{lang}.wikipedia.org/w/api.php"
+    try:
+        with httpx.Client(timeout=15, headers={"User-Agent": "LumenApp/1.0 (educational)"}) as http:
+            # 1) Trouver la meilleure page correspondant au sujet.
+            search = http.get(api, params={
+                "action": "query", "format": "json",
+                "list": "search", "srsearch": sujet, "srlimit": 1,
+            })
+            hits = search.json().get("query", {}).get("search", [])
+            if not hits:
+                return None
+            titre = hits[0]["title"]
+            # 2) Récupérer l'extrait (intro complète) en texte brut + l'URL canonique.
+            page = http.get(api, params={
+                "action": "query", "format": "json", "redirects": 1,
+                "prop": "extracts|info", "explaintext": 1, "exintro": 1,
+                "inprop": "url", "titles": titre,
+            })
+            pages = page.json().get("query", {}).get("pages", {})
+            for p in pages.values():
+                extrait = (p.get("extract") or "").strip()
+                if extrait:
+                    return {
+                        "titre": p.get("title", titre),
+                        "url": p.get("fullurl", f"https://{lang}.wikipedia.org/wiki/{titre.replace(' ', '_')}"),
+                        "extrait": extrait[:WIKI_CHARS],  # borne la taille envoyée à Gemini
+                    }
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Wikipédia indisponible (%s)", exc)
+    return None
+
+
+def gemini_summarize(system: str, user: str, wiki: dict | None = None) -> dict:
+    """Rédige la fiche via Gemini avec un schéma JSON imposé (sortie toujours valide).
+    Si `wiki` est fourni, Gemini se base UNIQUEMENT sur l'extrait Wikipédia réel
+    (faits vérifiés, vraie source). Sinon, il s'appuie sur ses connaissances."""
+    if wiki:
+        system_final = system + (
+            "\n\nTu disposes ci-dessous d'un EXTRAIT WIKIPÉDIA réel sur le sujet. "
+            "Rédige la fiche EN TE BASANT UNIQUEMENT sur cet extrait : n'ajoute aucun "
+            "fait qui n'y figure pas, n'invente aucun chiffre. La seule source est la "
+            "page Wikipédia fournie ; mets-la dans \"sources\". Si l'extrait ne suffit "
+            "pas pour un champ, laisse-le vide."
+        )
+        user_final = (
+            f"{user}\n\n--- EXTRAIT WIKIPÉDIA ({wiki['titre']}) ---\n{wiki['extrait']}\n"
+            f"--- URL SOURCE : {wiki['url']} ---"
+        )
     else:
-        gen_config["responseMimeType"] = "application/json"
-        # Sans recherche, on cadre les sources pour éviter toute URL inventée.
-        payload["systemInstruction"]["parts"].append({"text": (
-            "\nIMPORTANT : tu n'as PAS accès à la recherche web ici. "
-            "Ne cite donc QUE des sources stables et certaines : le site officiel "
-            "du sujet et sa page Wikipédia (URL canoniques, ex. "
-            "https://fr.wikipedia.org/wiki/Nom_du_sujet). N'invente JAMAIS d'URL "
-            "d'article précis. Indique dans \"avertissement\" que les faits "
-            "méritent vérification."
-        )})
+        system_final = system + (
+            "\n\nIMPORTANT : tu n'as PAS accès à la recherche web. Ne cite donc dans "
+            "\"sources\" QUE des URL stables et certaines (site officiel, Wikipédia). "
+            "N'invente JAMAIS d'URL d'article précis. Signale tout doute dans \"avertissement\"."
+        )
+        user_final = user
 
+    url = GEMINI_URL.format(model=GEMINI_MODEL)
+    payload = {
+        "systemInstruction": {"parts": [{"text": system_final}]},
+        "contents": [{"role": "user", "parts": [{"text": user_final}]}],
+        "generationConfig": {
+            "temperature": 0.4,
+            "maxOutputTokens": 2048,
+            "responseMimeType": "application/json",
+            "responseSchema": FICHE_SCHEMA,
+        },
+    }
     headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
     with httpx.Client(timeout=60) as http:
         resp = http.post(url, json=payload, headers=headers)
@@ -310,42 +395,27 @@ def gemini_summarize(system: str, user: str, use_search: bool) -> dict:
     candidates = resp.json().get("candidates") or []
     if not candidates:
         raise RuntimeError("Gemini summarize : aucune réponse.")
-    cand = candidates[0]
-    parts = cand.get("content", {}).get("parts", [])
+    parts = candidates[0].get("content", {}).get("parts", [])
     text = "".join(p.get("text", "") for p in parts).strip()
-    fiche = _extract_json(text)  # peut lever JSONDecodeError -> géré plus haut
+    fiche = _extract_json(text)
 
-    # Si la recherche a tourné, on remplace les sources par les pages réellement
-    # consultées (URLs vérifiées par Gemini), plus fiables que celles "devinées".
-    grounding = cand.get("groundingMetadata", {}) or {}
-    vraies = []
-    for chunk in grounding.get("groundingChunks", []) or []:
-        web = chunk.get("web", {}) or {}
-        if web.get("uri"):
-            vraies.append({
-                "titre": web.get("title", "") or web.get("uri", ""),
-                "url": web["uri"],
-                "fiabilite": "presse",
-            })
-    if vraies:
-        fiche["sources"] = vraies[:6]
+    # Avec Wikipédia, on garantit la source exacte (on n'autorise pas le modèle à dériver).
+    if wiki:
+        fiche["sources"] = [{
+            "titre": f"Wikipédia — {wiki['titre']}",
+            "url": wiki["url"],
+            "fiabilite": "encyclopedique",
+        }]
     return fiche
 
 
 @app.get("/")
 def health():
-    vision = GEMINI_MODEL if GEMINI_API_KEY else VISION_MODEL
-    vision_provider = "gemini" if GEMINI_API_KEY else "groq"
-    return {
-        "status": "ok",
-        "service": "lumen",
-        "models": {
-            "vision_provider": vision_provider,
-            "vision": vision,
-            "summary": SUMMARY_MODEL,           # Groq compound = recherche web réelle
-            "summary_fallback": GEMINI_MODEL if GEMINI_API_KEY else None,
-        },
-    }
+    if GEMINI_API_KEY:
+        models = {"provider": "gemini", "vision": GEMINI_MODEL, "summary": GEMINI_MODEL}
+    else:
+        models = {"provider": "groq", "vision": VISION_MODEL, "summary": SUMMARY_MODEL}
+    return {"status": "ok", "service": "lumen", "models": models}
 
 
 @app.get("/api/models")
@@ -430,7 +500,7 @@ async def identify(request: Request, image: UploadFile = File(...), mode: str = 
 
 @app.post("/api/summarize")
 def summarize(request: Request, body: SummarizeBody):
-    """Étage 2 — rédige la fiche sourcée (recherche web réelle)."""
+    """Étage 2 — rédige la fiche (Gemini, JSON imposé, sources canoniques)."""
     _check_rate_limit(request)
 
     system = SUMMARY_SYSTEM.replace("{langue}", body.langue)
@@ -441,18 +511,28 @@ def summarize(request: Request, body: SummarizeBody):
     )
 
     try:
-        # 1) Rédaction principale : Groq compound = recherche web réelle, gratuite.
-        fiche = groq_summarize(system, user)
-    except Exception as exc:  # noqa: BLE001  (inclut JSONDecodeError, 413, réseau…)
-        log.warning("Rédaction Groq indisponible (%s)", exc)
-        # 2) Repli : Gemini sans recherche, pour toujours renvoyer une fiche.
         if GEMINI_API_KEY:
-            try:
-                fiche = gemini_summarize(system, user, use_search=False)
-            except Exception as exc2:  # noqa: BLE001
-                log.error("Repli Gemini KO: %s", exc2)
-                raise HTTPException(status_code=502, detail="La génération de la fiche a échoué. Réessaie.")
+            # On récupère le vrai texte Wikipédia du sujet (gratuit, sans clé)…
+            wiki = wikipedia_context(body.sujet, body.langue)
+            # …puis Gemini rédige à partir de cet extrait réel (schéma JSON imposé).
+            fiche = gemini_summarize(system, user, wiki=wiki)
         else:
-            raise HTTPException(status_code=502, detail="La génération de la fiche a échoué. Réessaie.")
+            # Repli si aucune clé Gemini : Groq (sortie courte pour limiter le risque 413).
+            completion = client.chat.completions.create(
+                model=SUMMARY_MODEL,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                temperature=0.4,
+                max_tokens=1024,
+            )
+            fiche = _extract_json(completion.choices[0].message.content)
+    except json.JSONDecodeError:
+        log.error("JSON invalide depuis le modèle de résumé")
+        raise HTTPException(status_code=502, detail="La fiche n'a pas pu être structurée. Réessaie.")
+    except Exception as exc:  # noqa: BLE001
+        log.error("Erreur summarize: %s", exc)
+        raise HTTPException(status_code=502, detail="La génération de la fiche a échoué. Réessaie.")
 
     return JSONResponse(fiche)
