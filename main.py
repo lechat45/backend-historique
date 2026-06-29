@@ -23,6 +23,7 @@ import json
 import time
 import base64
 import logging
+import httpx
 from collections import defaultdict, deque
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -55,8 +56,15 @@ MAX_IMAGE_MB = float(os.environ.get("MAX_IMAGE_MB", "4"))          # limite base
 MAX_IMAGE_BYTES = int(MAX_IMAGE_MB * 1024 * 1024)
 RATE_LIMIT_PER_MIN = int(os.environ.get("RATE_LIMIT_PER_MIN", "20"))
 
-VISION_MODEL = os.environ.get("VISION_MODEL", "qwen/qwen3.6-27b")   # multimodal, JSON mode
+VISION_MODEL = os.environ.get("VISION_MODEL", "qwen/qwen3.6-27b")   # vision Groq (repli)
 SUMMARY_MODEL = os.environ.get("SUMMARY_MODEL", "groq/compound")    # recherche web intégrée
+
+# --- Vision Gemini (optionnelle mais recommandée pour les logos) ---------- #
+# Si GEMINI_API_KEY est défini, l'identification passe par Gemini (bien meilleur
+# pour reconnaître logos, marques, monuments). Sinon, on retombe sur Groq.
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3-flash")
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
 ALLOWED_MIME = {"image/jpeg", "image/png", "image/webp"}
 
@@ -189,9 +197,66 @@ class SummarizeBody(BaseModel):
 # Endpoints
 # --------------------------------------------------------------------------- #
 
+def _empty_identify() -> dict:
+    """Résultat neutre quand l'identification n'aboutit pas (au lieu d'une 502)."""
+    return {
+        "type": "autre",
+        "nom_probable": "",
+        "candidats": [],
+        "texte_ocr": "",
+        "indices_visuels": "",
+        "confiance": 0,
+    }
+
+
+def gemini_identify(b64: str, mime: str, indication: str) -> dict:
+    """Identification via Gemini — bien meilleure pour les logos, marques, monuments."""
+    url = GEMINI_URL.format(model=GEMINI_MODEL)
+    payload = {
+        "systemInstruction": {"parts": [{"text": VISION_SYSTEM}]},
+        "contents": [
+            {
+                "role": "user",
+                "parts": [
+                    {"text": "Identifie le sujet de cette image." + indication},
+                    {"inlineData": {"mimeType": mime, "data": b64}},
+                ],
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.2,
+            "maxOutputTokens": 1024,
+            "responseMimeType": "application/json",
+        },
+    }
+    headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
+    with httpx.Client(timeout=45) as http:
+        resp = http.post(url, json=payload, headers=headers)
+    if resp.status_code != 200:
+        # On laisse le message Gemini remonter dans les logs (modèle introuvable, quota…).
+        raise RuntimeError(f"Gemini {resp.status_code}: {resp.text[:300]}")
+    candidates = resp.json().get("candidates") or []
+    if not candidates:
+        return _empty_identify()
+    parts = candidates[0].get("content", {}).get("parts", [])
+    text = "".join(p.get("text", "") for p in parts).strip()
+    if not text:
+        return _empty_identify()
+    try:
+        return _extract_json(text)
+    except json.JSONDecodeError:
+        return _empty_identify()
+
+
 @app.get("/")
 def health():
-    return {"status": "ok", "service": "lumen", "models": {"vision": VISION_MODEL, "summary": SUMMARY_MODEL}}
+    provider = "gemini" if GEMINI_API_KEY else "groq"
+    vision = GEMINI_MODEL if GEMINI_API_KEY else VISION_MODEL
+    return {
+        "status": "ok",
+        "service": "lumen",
+        "models": {"vision_provider": provider, "vision": vision, "summary": SUMMARY_MODEL},
+    }
 
 
 @app.post("/api/identify")
@@ -218,35 +283,31 @@ async def identify(request: Request, image: UploadFile = File(...), mode: str = 
         indication = " L'utilisateur indique qu'il s'agit probablement d'un sujet historique."
 
     try:
-        completion = client.chat.completions.create(
-            model=VISION_MODEL,
-            messages=[
-                {"role": "system", "content": VISION_SYSTEM},
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "Identifie le sujet de cette image." + indication},
-                        {"type": "image_url", "image_url": {"url": data_uri}},
-                    ],
-                },
-            ],
-            temperature=0.2,
-            max_tokens=600,
-        )
-        raw = completion.choices[0].message.content or ""
-        try:
-            result = _extract_json(raw)
-        except json.JSONDecodeError:
-            # Le modèle n'a pas renvoyé de JSON exploitable : on échoue proprement
-            # plutôt que de renvoyer une 502 opaque.
-            result = {
-                "type": "autre",
-                "nom_probable": "",
-                "candidats": [],
-                "texte_ocr": "",
-                "indices_visuels": "",
-                "confiance": 0,
-            }
+        if GEMINI_API_KEY:
+            # Voie recommandée : Gemini (meilleure reconnaissance visuelle).
+            result = gemini_identify(b64, image.content_type, indication)
+        else:
+            # Repli : vision Groq.
+            completion = client.chat.completions.create(
+                model=VISION_MODEL,
+                messages=[
+                    {"role": "system", "content": VISION_SYSTEM},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Identifie le sujet de cette image." + indication},
+                            {"type": "image_url", "image_url": {"url": data_uri}},
+                        ],
+                    },
+                ],
+                temperature=0.2,
+                max_tokens=600,
+            )
+            raw = completion.choices[0].message.content or ""
+            try:
+                result = _extract_json(raw)
+            except json.JSONDecodeError:
+                result = _empty_identify()
     except Exception as exc:  # noqa: BLE001
         log.error("Erreur identify: %s", exc)
         raise HTTPException(status_code=502, detail="L'identification a échoué. Réessaie.")
