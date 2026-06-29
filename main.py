@@ -129,35 +129,29 @@ SUMMARY_SYSTEM = (
     "Tu es un rédacteur encyclopédique pour une app mobile de scan intelligent. "
     "À partir d'un SUJET identifié (entreprise ou événement historique), tu "
     "produis une fiche captivante, factuelle et concise, en {langue}.\n\n"
-    "RÈGLES ABSOLUES\n"
-    "- Tu réponds UNIQUEMENT avec un objet JSON valide. Aucun texte avant ou "
-    "après, aucun bloc markdown, aucun commentaire.\n"
-    "- Tu utilises la recherche web pour VÉRIFIER les faits et chiffres. Tu ne "
-    "cites QUE des sources réellement consultées, avec leur URL exacte. Tu "
-    "n'inventes JAMAIS d'URL ni de statistique.\n"
-    "- Si une donnée est incertaine ou introuvable, tu l'omets plutôt que de la "
-    "deviner, et tu le signales dans \"avertissement\".\n"
-    "- Ton captivant mais sobre : phrases courtes, zéro remplissage.\n\n"
-    "SCHÉMA DE SORTIE (respecte exactement les clés)\n"
-    "{\n"
-    '  "sujet": "nom exact identifié",\n'
-    '  "categorie": "entreprise | histoire | inconnu",\n'
-    '  "confiance": 0,\n'
-    '  "accroche": "une phrase qui donne envie de lire",\n'
-    '  "resume": "2 à 4 paragraphes structurés",\n'
-    '  "chiffres_cles": [{"label": "", "valeur": "", "annee": "ou null"}],\n'
-    '  "chronologie": [{"date": "", "evenement": ""}],\n'
-    '  "impact": "pourquoi c\'est important aujourd\'hui",\n'
-    '  "le_saviez_vous": ["fait surprenant et vérifié"],\n'
-    '  "sources": [{"titre": "", "url": "", "fiabilite": "officielle | encyclopedique | presse | autre"}],\n'
-    '  "pour_approfondir": ["piste de lecture ou mot-clé"],\n'
-    '  "avertissement": null\n'
-    "}\n\n"
+    "RÈGLES\n"
+    "- Reste strictement factuel : n'invente aucun chiffre ni aucune source.\n"
+    "- Si une donnée est incertaine ou introuvable, laisse le champ vide et "
+    "explique-le brièvement dans le champ avertissement.\n"
+    "- Style captivant mais sobre : phrases courtes, zéro remplissage.\n\n"
+    "CONTENU ATTENDU DE CHAQUE CHAMP\n"
+    "- sujet : le nom exact identifié (texte simple, ex. « Lego »).\n"
+    "- categorie : « entreprise », « histoire » ou « inconnu ».\n"
+    "- confiance : un nombre de 0 à 100 selon ta certitude.\n"
+    "- accroche : une seule phrase qui donne envie de lire.\n"
+    "- resume : 2 à 4 courts paragraphes structurés.\n"
+    "- chiffres_cles : faits chiffrés (label, valeur, et année si pertinent).\n"
+    "- chronologie : dates clés (date + événement), surtout pour l'histoire.\n"
+    "- impact : pourquoi le sujet compte aujourd'hui.\n"
+    "- le_saviez_vous : faits surprenants et vérifiés.\n"
+    "- sources : titres et URL réelles (laisse vide si tu n'es pas sûr).\n"
+    "- pour_approfondir : pistes de lecture ou mots-clés.\n"
+    "- avertissement : tout doute ou limite (sinon laisse vide).\n\n"
     "CONTRAINTES PAR CATÉGORIE\n"
     "- entreprise : fondation, fondateurs, secteur, chiffres clés (CA, effectif, "
     "valorisation) AVEC année, faits marquants.\n"
-    "- histoire : contexte, dates clés dans \"chronologie\", causes, conséquences, postérité.\n"
-    "- inconnu : champs vides, confiance basse, explication dans \"avertissement\"."
+    "- histoire : contexte, dates clés dans la chronologie, causes, conséquences, postérité.\n"
+    "- inconnu : champs vides, confiance basse, explication dans avertissement."
 )
 
 
@@ -358,6 +352,23 @@ def wikipedia_context(sujet: str, langue: str) -> dict | None:
     return None
 
 
+def _recover_double_encoded(fiche: dict) -> dict:
+    """Filet de sécurité : si le modèle a double-encodé (toute la fiche coincée dans
+    le champ 'sujet'), on tente de reconstruire l'objet correct."""
+    s = fiche.get("sujet")
+    if not (isinstance(s, str) and ('","resume":' in s or '","categorie":' in s)):
+        return fiche
+    try:
+        repaired = json.loads('{"sujet":"' + s + "}")
+        if isinstance(repaired, dict) and "resume" in repaired:
+            return repaired
+    except Exception:  # noqa: BLE001
+        pass
+    # Au minimum, on nettoie le titre (garde le nom avant le JSON parasite).
+    fiche["sujet"] = s.split('","', 1)[0].strip().strip('"')
+    return fiche
+
+
 def gemini_summarize(system: str, user: str, wiki: dict | None = None) -> dict:
     """Rédige la fiche via Gemini avec un schéma JSON imposé (sortie toujours valide).
     Si `wiki` est fourni, Gemini se base UNIQUEMENT sur l'extrait Wikipédia réel
@@ -407,6 +418,7 @@ def gemini_summarize(system: str, user: str, wiki: dict | None = None) -> dict:
     parts = candidates[0].get("content", {}).get("parts", [])
     text = "".join(p.get("text", "") for p in parts).strip()
     fiche = _extract_json(text)
+    fiche = _recover_double_encoded(fiche)  # filet de sécurité anti double-encodage
 
     # Avec Wikipédia, on garantit la source exacte (on n'autorise pas le modèle à dériver).
     if wiki:
@@ -516,7 +528,7 @@ def summarize(request: Request, body: SummarizeBody):
     user = (
         f"Sujet : {body.sujet}\n"
         f"Catégorie présumée : {body.categorie}\n"
-        f"Rédige la fiche en {body.langue}, en respectant le schéma JSON imposé."
+        f"Rédige la fiche en {body.langue}."
     )
 
     try:
