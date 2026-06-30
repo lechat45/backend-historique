@@ -393,45 +393,54 @@ def gemini_summarize(system: str, user: str, wiki: dict | None = None) -> dict:
         )
         user_final = user
 
-    base_gen = {
-        "temperature": 0.4,
-        "responseMimeType": "application/json",
-        "responseSchema": FICHE_SCHEMA,
-    }
-    sys_instr = {"parts": [{"text": system_final}]}
+    # Gabarit JSON propre (mêmes clés que la fiche). On NE met PAS de responseSchema :
+    # le décodage contraint de Gemini 3 déraille sur cette structure imbriquée.
+    schema_hint = (
+        "\n\nRéponds en JSON valide, avec EXACTEMENT ces clés et cette structure, "
+        "sans aucun texte ni balise autour :\n"
+        '{"sujet":"nom court","categorie":"entreprise|histoire|inconnu","confiance":0,'
+        '"accroche":"","resume":"","chiffres_cles":[{"label":"","valeur":"","annee":""}],'
+        '"chronologie":[{"date":"","evenement":""}],"impact":"","le_saviez_vous":[""],'
+        '"sources":[{"titre":"","url":"","fiabilite":""}],"pour_approfondir":[""],'
+        '"avertissement":""}'
+    )
+    sys_instr = {"parts": [{"text": system_final + schema_hint}]}
     contents = [{"role": "user", "parts": [{"text": user_final}]}]
     headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
     url = GEMINI_URL.format(model=GEMINI_MODEL)
 
-    # Gemini 3 compte son "raisonnement" dans maxOutputTokens : par défaut il remplit
-    # presque tout le budget, ce qui tronque le JSON. On réduit donc le raisonnement.
-    # On essaie plusieurs réglages (le bon paramètre varie selon la version du modèle) :
-    #  1) thinkingLevel bas (Gemini 3)  2) thinkingBudget bas (compat 2.5/3)  3) gros budget brut.
-    attempts = [
-        {**base_gen, "maxOutputTokens": 8192, "thinkingConfig": {"thinkingLevel": "low"}},
-        {**base_gen, "maxOutputTokens": 8192, "thinkingConfig": {"thinkingBudget": 512}},
-        {**base_gen, "maxOutputTokens": 65535},
-    ]
+    gen = {
+        "temperature": 0.4,
+        "maxOutputTokens": 8192,
+        "responseMimeType": "application/json",
+        # Réduit le raisonnement de Gemini 3 pour laisser sortir le JSON complet.
+        "thinkingConfig": {"thinkingLevel": "low"},
+    }
+    payload = {"systemInstruction": sys_instr, "contents": contents, "generationConfig": gen}
 
+    # Un SEUL appel, mais on retente brièvement en cas de surcharge passagère (503).
+    # On ne retente PAS sur 429 (quota) : ce serait inutile et gaspilleur.
     text = ""
-    with httpx.Client(timeout=120) as http:
-        for gen in attempts:
-            payload = {"systemInstruction": sys_instr, "contents": contents, "generationConfig": gen}
+    last = ""
+    with httpx.Client(timeout=90) as http:
+        for wait in (0, 2, 5):
+            if wait:
+                time.sleep(wait)
             resp = http.post(url, json=payload, headers=headers)
-            if resp.status_code != 200:
-                log.warning("Gemini summarize %s: %s", resp.status_code, resp.text[:200])
+            if resp.status_code == 503:
+                last = "Gemini surchargé (503)"
                 continue
+            if resp.status_code == 429:
+                raise RuntimeError("Quota Gemini dépassé (429)")
+            if resp.status_code != 200:
+                raise RuntimeError(f"Gemini summarize {resp.status_code}: {resp.text[:200]}")
             cand = (resp.json().get("candidates") or [{}])[0]
             parts = cand.get("content", {}).get("parts", [])
-            t = "".join(p.get("text", "") for p in parts).strip()
-            if t and cand.get("finishReason") != "MAX_TOKENS":
-                text = t
-                break
-            if t and not text:  # garde une sortie tronquée en dernier recours
-                text = t
+            text = "".join(p.get("text", "") for p in parts).strip()
+            break
 
     if not text:
-        raise RuntimeError("Gemini summarize : réponse vide ou tronquée.")
+        raise RuntimeError(last or "Gemini summarize : réponse vide.")
 
     fiche = _extract_json(text)
     fiche = _recover_double_encoded(fiche)  # filet de sécurité anti double-encodage
@@ -571,5 +580,11 @@ def summarize(request: Request, body: SummarizeBody):
     except Exception as exc:  # noqa: BLE001
         log.error("Erreur summarize: %s", exc)
         raise HTTPException(status_code=502, detail="La génération de la fiche a échoué. Réessaie.")
+
+    # Garde-fou : si le titre est aberrant (modèle qui « collapse » tout dedans),
+    # on le remplace par le sujet réellement identifié.
+    sujet = fiche.get("sujet")
+    if not isinstance(sujet, str) or len(sujet) > 120 or "_" in sujet and len(sujet) > 60:
+        fiche["sujet"] = body.sujet
 
     return JSONResponse(fiche)
